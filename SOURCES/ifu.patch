@@ -1,0 +1,1187 @@
+From 6747cc310e6e8075078a4f68f69d6f8e5413018f Mon Sep 17 00:00:00 2001
+From: Joe Lawrence <joe.lawrence@redhat.com>
+Date: Thu, 14 Nov 2019 14:59:55 -0500
+Subject: [RHEL-8.1 KPATCH v4] kvm: mmu: ITLB_MULTIHIT mitigation
+
+commit ("kvm: mmu: ITLB_MULTIHIT mitigation") contains the heart of the
+IFU fix, so this kpatch starts with those changes to implement a minimal
+avoidance.
+
+Changes since last build:
+[x86_64]:
+bugs.o: new function: kpatch_cpu_mitigations_off
+bugs.o: new function: kpatch_cpu_show_itlb_multihit
+bugs.o: new function: kpatch_taa_post_unpatch
+bugs.o: new function: kpatch_tsx_async_abort_show_state
+bugs.o: new function: kpatch_vmlinux_post_unpatch_callback
+bugs.o: new function: kpatch_vmlinux_pre_patch_callback
+kvm_main.o: changed function: kvm_dev_ioctl
+kvm_main.o: changed function: kvm_put_kvm
+mmu.o: changed function: __kvm_mmu_audit
+mmu.o: changed function: ept_page_fault
+mmu.o: changed function: nonpaging_page_fault
+mmu.o: changed function: paging32_page_fault
+mmu.o: changed function: paging64_page_fault
+mmu.o: changed function: set_spte
+mmu.o: changed function: tdp_page_fault
+mmu.o: new function: __direct_map.constprop.138
+mmu.o: new function: is_nx_huge_page_enabled
+mmu.o: new function: kpatch_ifu_post_patch_kvm_mmu
+mmu.o: new function: kpatch_ifu_post_unpatch_kvm_mmu
+mmu.o: new function: kpatch_ifu_pre_patch_kvm_mmu
+mmu.o: new function: kpatch_ifu_pre_unpatch_kvm_mmu
+proc.o: changed function: show_cpuinfo
+x86.o: changed function: kvm_get_arch_capabilities
+
+
+[ppc64le]:
+
+
+---------------------------
+
+Modifications:
+
+* This kpatch is x86-only.
+
+* The livepatch consistency model doesn't lend itself to converting the
+  kvm_lock spinlock to a mutex.  As per Paolo's advice, we keep the
+  spinlock in place and add a new mutex (kpatch_kvm_mutex), but the only
+  reader that takes the mutex will be set_nx_huge_pages.  Writers (there
+  are just two, kvm_create_vm and kvm_destroy_vm) are patched to take the
+  mutex _and_ the spinlock.  Everything else can keep taking the spinlock
+  and needs no patching.
+
+* mmu_page.lpage_disallowed is only needed for NX huge page recovery
+  code, which has been dropped from this kpatch.  Associated routines
+  like account_huge_nx_page() and unaccount_huge_nx_page() are likewise
+  omitted from the kpatch.
+
+* cpu_mitigations_off() needs to read cpu_mitigations, which is not
+  exported, so resort to the usual kallsyms tricks to look it up and
+  implement our own kpatch_cpu_mitigations_off().
+
+* boot_cpu_has_itlb_multihit_bug() relies on cpu_set_bug_bits() and
+  cpu_vuln_whitelist[] updates.  Provide our own custom
+  kpatch_boot_cpu_has_itlb_multihit_bug() verison that determines
+  vulnerability at runtime.
+
+* Mimic set_nx_huge_pages("auto", NULL) when the kpatch loads, as we
+  can't use the kernel boot parameter.
+
+Shadow variables:
+
+  For kpatch callback refcounts:
+
+  KLP_SHADOW_CPU_BUGS_COUNT		vmlinux :: cpu/bugs.c
+  KLP_SHADOW_KVM_COUNT			kvm :: arch/x86/kvm/mmu.c
+
+  For persistent values across kpatch upgrades:
+
+  KLP_SHADOW_KVM_MITIGATION		kpatch_itlb_multihit_kvm_mitigation
+  KLP_SHADOW_KVM_MUTEX			kpatch_kvm_mutex
+
+KLP_SHADOW_KVM_MITIGATION
+-------------------------
+
+kpatch_itlb_multihit_kvm_mitigation holds three values that are reported
+via /sys/devices/system/cpu/vulnerabilities/itlb_multihit:
+
+  -1	Processor vulnerable
+  0	KVM: Vulnerable
+  1	KVM: Mitigation: Split huge pages
+
+It is initialized to -1 on initial kpatch load and reset to this value
+on final kpatch unload.
+
+When kvm.ko is loaded, it may be set to 0 to non-zero depending up on
+the determination of get_nx_auto_mode().  That function derives its
+answer from:
+
+  boot_cpu_has_bug(X86_BUG_ITLB_MULTIHIT) - updated by cpu/bugs.c's
+                                            pre-patch callback
+
+  kpatch_cpu_mitigations_off() - wrapper around the kernel's
+                                 cpu_mitigations enum
+
+Important routines:
+
+  alloc:
+  cpu/bugs.c :: kpatch_init_kpatch_itlb_multihit_kvm_mitigation()
+
+  readers:
+  cpu/bugs.c :: itlb_multihit_show_state()
+  kvm/mmu.c  :: is_nx_huge_page_enabled()
+
+  writers:
+  cpu/bugs.c :: kpatch_init_kpatch_itlb_multihit_kvm_mitigation()
+  kvm/mmu.c  :: __set_nx_huge_pages()
+  kvm/mmu.c  :: kpatch_exit_nx_huge_pages()
+
+  free:
+  cpu/bugs.c :: kpatch_exit_kpatch_itlb_multihit_kvm_mitigation()
+
+itlb_multihit_show_state needs to read KLP_SHADOW_KVM_MITIGATION and may
+be called as part of the sysfs interface, so it should be allocated and
+initialized before kpatch_init_itlb_multihit_sysfs.
+
+  itlb_multihit_show_state
+    called by kpatch_cpu_show_itlb_multihit
+      ... called by sysfs interface
+
+As far as I can tell, no of the caller of is_nx_huge_page_enabled() will
+be executing before the pre-patch handler:
+
+  is_nx_huge_page_enabled
+    called by set_spte
+      called by mmu_set_spte
+        called by direct_pte_prefetch_many
+          called by __direct_pte_prefetch
+            called by direct_pte_prefetch
+              called by __direct_map
+        called by __direct_map
+          called by nonpaging_map
+       called by tdp_page_fault
+
+    called by tdp_page_fault
+      called by context->page_fault
+
+    called by disallowed_hugepage_adjust
+      called by __direct_map
+
+    called by nonpaging_map
+      called by nonpaging_page_fault
+       called by  context->page_fault
+
+KLP_SHADOW_KVM_MUTEX
+--------------------
+
+  alloc:
+  kvm/mmu.c      :: kpatch_init_kpatch_kvm_mutex()
+
+  readers:
+  kvm/kvm_main.c :: kvm_create_vm()
+  kvm/kvm_main.c :: kvm_create_kvm_destroy_vm()
+  kvm/kvm_mmu.c  :: kpatch_init_nx_huge_pages()
+
+  writers:
+  kvm/kvm_mmu.c  :: kpatch_init_kpatch_kvm_mutex()
+
+  free:
+  kvm/kvm_mmu.c  :: kpatch_exit_kpatch_kvm_mutex()
+
+Only interesting ordering is that KLP_SHADOW_KVM_MUTEX is allocated and
+initialized before kpatch_init_nx_huge_pages(), which is true as the
+former occurs in the pre-patch handler and the latter in a post-patch
+handler.
+
+Other notes:
+
+KPATCH_CVE_2018_11207 is defined to help avoid inadvertent non-x86_64
+build changes in virt/kvm/kvm_main.c.
+
+commit 732ed34fecfb40761211bb9ce4bd8a2896943b84
+Author: Paolo Bonzini <pbonzini@redhat.com>
+Date:   Sat Nov 2 12:01:26 2019 -0400
+
+    [kvm] KVM: x86: make FNAME(fetch) and __direct_map more similar
+
+    Message-id: <20191102120137.22750-7-pbonzini@redhat.com>
+    Patchwork-id: 811
+    O-Subject: [EMBARGOED RHEL8.1 PATCH v8 06/17] KVM: x86: make FNAME(fetch) and __direct_map more similar
+    Bugzilla: 1690344
+    Z-Bugzilla: 1698416
+    CVE: CVE-2018-12207
+
+    These two functions are basically doing the same thing through
+    kvm_mmu_get_page, link_shadow_page and mmu_set_spte; yet, for historical
+    reasons, their code looks very different.  This patch tries to take the
+    best of each and make them very similar, so that it is easy to understand
+    changes that apply to both of them.
+
+    Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+    (cherry picked from commit 3fcf2d1bdeb6a513523cb2c77012a6b047aa859c)
+    Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+    Signed-off-by: Frantisek Hrbata <fhrbata@redhat.com>
+
+commit f5a26f2ce05f66a7ea81c31c29ac639164b13536
+Author: Paolo Bonzini <pbonzini@redhat.com>
+Date:   Sat Nov 2 12:01:32 2019 -0400
+
+    [x86] x86/cpu: Add Tremont to the cpu vulnerability whitelist
+
+    Message-id: <20191102120137.22750-13-pbonzini@redhat.com>
+    Patchwork-id: 780
+    O-Subject: [EMBARGOED RHEL8.1 PATCH v8 12/17] x86/cpu: Add Tremont to the cpu vulnerability whitelist
+    Bugzilla: 1690344
+    Z-Bugzilla: 1698416
+    CVE: CVE-2018-12207
+
+    From: Pawan Gupta <pawan.kumar.gupta@linux.intel.com>
+
+    This patch adds new cpu family ATOM_TREMONT_X to the cpu vunerability
+    whitelist. ATOM_TREMONT_X is not affected by X86_BUG_ITLB_MULTIHIT. There
+    may be more bugs not affecting ATOM_TREMONT_X which are not known at
+    this point and could be added later.
+
+    Signed-off-by: Pawan Gupta <pawan.kumar.gupta@linux.intel.com>
+    Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+    Signed-off-by: Frantisek Hrbata <fhrbata@redhat.com>
+
+commit bedeaa9ba9f0c0d0a0736863edaac5cfb7f32c83
+Author: Paolo Bonzini <pbonzini@redhat.com>
+Date:   Sat Nov 2 12:01:34 2019 -0400
+
+    [kvm] kvm: mmu: ITLB_MULTIHIT mitigation
+
+    Message-id: <20191102120137.22750-15-pbonzini@redhat.com>
+    Patchwork-id: 819
+    O-Subject: [EMBARGOED RHEL8.1 PATCH v8 14/17] kvm: mmu: ITLB_MULTIHIT mitigation
+    Bugzilla: 1690344
+    Z-Bugzilla: 1698416
+    CVE: CVE-2018-12207
+
+    With some Intel processors, putting the same virtual address in the TLB
+    as both a 4 KiB and 2 MiB page can confuse the instruction fetch unit
+    and cause the processor to issue a machine check.  Unfortunately if EPT
+    page tables use huge pages, it possible for a malicious guest to cause
+    this situation.
+
+    This patch adds a knob to mark huge pages as non-executable. When the
+    nx_huge_pages parameter is enabled (and we are using EPT), all huge pages
+    are marked as NX. If the guest attempts to execute in one of those pages,
+    the page is broken down into 4K pages, which are then marked executable.
+
+    This is not an issue for shadow paging (except nested EPT), because then
+    the host is in control of TLB flushes and the problematic situation cannot
+    happen.  With nested EPT, again the nested guest can cause problems so we
+    treat shadow and direct EPT the same.
+
+    Signed-off-by: Junaid Shahid <junaids@google.com>
+    Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+    Signed-off-by: Frantisek Hrbata <fhrbata@redhat.com>
+
+Signed-off-by: Joe Lawrence <joe.lawrence@redhat.com>
+---
+ arch/x86/kernel/cpu/bugs.c     | 239 +++++++++++++++++++++++++-
+ arch/x86/kernel/cpu/proc.c     |   4 +
+ arch/x86/kvm/mmu.c             | 305 +++++++++++++++++++++++++++++----
+ arch/x86/kvm/mmu_audit.c       |  11 ++
+ arch/x86/kvm/paging_tmpl.h     |  34 ++--
+ arch/x86/kvm/x86.c             |   9 +
+ include/linux/klp_2018_12207.h |  42 +++++
+ virt/kvm/kvm_main.c            |  29 ++++
+ 8 files changed, 623 insertions(+), 50 deletions(-)
+ create mode 100644 include/linux/klp_2018_12207.h
+
+diff --git a/arch/x86/kernel/cpu/bugs.c b/arch/x86/kernel/cpu/bugs.c
+index 1f77f816fabd..ad9bda213489 100644
+--- a/arch/x86/kernel/cpu/bugs.c
++++ b/arch/x86/kernel/cpu/bugs.c
+@@ -1717,14 +1717,251 @@ static void kpatch_taa_post_unpatch(void)
+ 	klp_shadow_free(NULL, KLP_SHADOW_TAA_DATA, NULL);
+ }
+ 
++
++#include <linux/klp_2018_12207.h>
++#include "kpatch-macros.h"
++
++/*
++ * kvm.ko :: mmu.c :: get_nx_auto_mode() wants to read cpu_mitigations
++ * via inlined cpu_mitigations_off(), but the former isn't exported.
++ * Provide our own non-inlined kpatch version here from vmlinux context.
++ */
++bool kpatch_cpu_mitigations_off(void)
++{
++	return cpu_mitigations == CPU_MITIGATIONS_OFF;
++}
++
++/*
++ * Mimic cpu_set_bug_bits() and cpu_vuln_whitelist[] changes with
++ * kpatch_cpu_matches_itlb_multihit().
++ */
++#include <asm/intel-family.h>
++static bool kpatch_cpu_matches_itlb_multihit(void)
++{
++	u64 ia32_cap = 0;
++
++	if (boot_cpu_data.x86_vendor != X86_VENDOR_INTEL)
++		return false;
++
++	switch (boot_cpu_data.x86_model) {
++	case INTEL_FAM6_ATOM_SALTWELL:
++	case INTEL_FAM6_ATOM_SALTWELL_TABLET:
++	case INTEL_FAM6_ATOM_SALTWELL_MID:
++	case INTEL_FAM6_ATOM_BONNELL:
++	case INTEL_FAM6_ATOM_BONNELL_MID:
++	case INTEL_FAM6_ATOM_SILVERMONT:
++	case INTEL_FAM6_ATOM_SILVERMONT_X:
++	case INTEL_FAM6_ATOM_SILVERMONT_MID:
++	case INTEL_FAM6_ATOM_AIRMONT:
++	case INTEL_FAM6_XEON_PHI_KNL:
++	case INTEL_FAM6_XEON_PHI_KNM:
++	case INTEL_FAM6_ATOM_AIRMONT_MID:
++	case INTEL_FAM6_ATOM_GOLDMONT:
++	case INTEL_FAM6_ATOM_GOLDMONT_X:
++	case INTEL_FAM6_ATOM_GOLDMONT_PLUS:
++	case INTEL_FAM6_ATOM_TREMONT_X:
++		return false;
++	}
++
++	if (cpu_has(&boot_cpu_data, X86_FEATURE_ARCH_CAPABILITIES))
++		rdmsrl(MSR_IA32_ARCH_CAPABILITIES, ia32_cap);
++
++	/* Set ITLB_MULTIHIT bug if cpu is not in the whitelist and not mitigated */
++	if (!(ia32_cap & ARCH_CAP_PSCHANGE_MC_NO))
++		return true;
++
++	return false;
++}
++
++/*
++ * Dynamically update the cpu bug table when the first kpatch loads and
++ * then clear the X86_BUG_ITLB_MULTIHIT bit when the last kpatch
++ * unloads.
++ */
++static void kpatch_init_boot_cpu_bug_ifu(void)
++{
++	if (kpatch_cpu_matches_itlb_multihit())
++		setup_force_cpu_bug(X86_BUG_ITLB_MULTIHIT);
++}
++
++static void kpatch_exit_boot_cpu_bug_ifu(void)
++{
++	setup_clear_cpu_cap(X86_BUG_ITLB_MULTIHIT);
++}
++
++/*
++ * /sys/devices/system/cpu/vulnerabilities/itlb_multihit implementation.
++ * Note that we report the KLP_SHADOW_KVM_MITIGATION value, which is
++ * updated when kvm.ko loads and unloads.
++ */
++static ssize_t itlb_multihit_show_state(char *buf)
++{
++	int *kpatch_itlb_multihit_kvm_mitigation;
++
++	kpatch_itlb_multihit_kvm_mitigation =
++		klp_shadow_get(NULL, KLP_SHADOW_KVM_MITIGATION);
++	if (WARN_ON(!kpatch_itlb_multihit_kvm_mitigation))
++		return -EINVAL;
++
++	if (*kpatch_itlb_multihit_kvm_mitigation == -1)
++		return sprintf(buf, "Processor vulnerable\n");
++
++	if (*kpatch_itlb_multihit_kvm_mitigation)
++		return sprintf(buf, "KVM: Mitigation: Split huge pages\n");
++	else
++		return sprintf(buf, "KVM: Vulnerable\n");
++}
++
++ssize_t kpatch_cpu_show_itlb_multihit(struct device *dev, struct device_attribute *attr, char *buf)
++{
++	if (!boot_cpu_has_bug(X86_BUG_ITLB_MULTIHIT))
++		return sprintf(buf, "Not affected\n");
++
++	return itlb_multihit_show_state(buf);
++}
++
++static DEVICE_ATTR(itlb_multihit, 0444, kpatch_cpu_show_itlb_multihit, NULL);
++
++static struct attribute *kpatch_sysfs_itlb_multihit_attrs[] = {
++	&dev_attr_itlb_multihit.attr,
++	NULL
++};
++
++static const struct attribute_group kpatch_ifu_sysfs_group = {
++	.name  = "vulnerabilities",
++	.attrs = kpatch_sysfs_itlb_multihit_attrs,
++};
++
++/*
++ * Setup the sysfs interface when the first kpatch loads and remove it
++ * when the last unloads.
++ */
++static int kpatch_init_itlb_multihit_sysfs(void)
++{
++	int ret;
++
++	ret = sysfs_merge_group(&cpu_subsys.dev_root->kobj,
++			&kpatch_ifu_sysfs_group);
++	if (ret)
++		pr_err("Unable to register itlb_multihit vulnerabilities sysfs entry\n");
++
++	return ret;
++}
++
++static void kpatch_exit_itlb_multihit_sysfs(void)
++{
++	sysfs_unmerge_group(&cpu_subsys.dev_root->kobj, &kpatch_ifu_sysfs_group);
++}
++
++/*
++ * Setup the KLP_SHADOW_KVM_MITIGATION shadow variable used by the sysfs
++ * interface when the first kpatch loads and clean it up when the last
++ * exits.
++ */
++static int kpatch_init_kpatch_itlb_multihit_kvm_mitigation(void)
++{
++	int *kpatch_itlb_multihit_kvm_mitigation;
++
++	kpatch_itlb_multihit_kvm_mitigation =
++		klp_shadow_alloc(NULL, KLP_SHADOW_KVM_MITIGATION,
++				 sizeof(*kpatch_itlb_multihit_kvm_mitigation),
++				 GFP_KERNEL, NULL, NULL);
++	if (WARN_ON(!kpatch_itlb_multihit_kvm_mitigation))
++		return -ENOMEM;
++
++	*kpatch_itlb_multihit_kvm_mitigation = -1;
++
++	return 0;
++}
++
++static void kpatch_exit_kpatch_itlb_multihit_kvm_mitigation(void)
++{
++	klp_shadow_free(NULL, KLP_SHADOW_KVM_MITIGATION, NULL);
++}
++
++
++/*
++ * kpatch pre-patch and post-unpatch handlers
++ */
++static int kpatch_ifu_pre_patch(void)
++{
++	int *refcount;
++	int ret;
++
++	/* patch upgrade ref counting - only do init the first time */
++	refcount = klp_shadow_get(NULL, KLP_SHADOW_CPU_BUGS_COUNT);
++	if (refcount) {
++		(*refcount)++;
++		return 0;
++	}
++	refcount = klp_shadow_alloc(NULL, KLP_SHADOW_CPU_BUGS_COUNT,
++				    sizeof(*refcount), GFP_KERNEL,
++				    NULL, NULL);
++	if (WARN_ON(!refcount))
++		return -ENOMEM;
++
++	*refcount = 1;
++
++	kpatch_init_boot_cpu_bug_ifu();
++
++	ret = kpatch_init_kpatch_itlb_multihit_kvm_mitigation();
++	if (ret)
++		goto err;
++
++	ret = kpatch_init_itlb_multihit_sysfs();
++	if (ret)
++		goto err_itlb_multihit_kvm_mitigation;
++
++	return 0;
++
++err_itlb_multihit_kvm_mitigation:
++	kpatch_exit_kpatch_itlb_multihit_kvm_mitigation();
++err:
++	kpatch_exit_boot_cpu_bug_ifu();
++	klp_shadow_free(NULL, KLP_SHADOW_CPU_BUGS_COUNT, NULL);
++	return ret;
++}
++
++static void kpatch_ifu_post_unpatch(void)
++{
++	int *refcount;
++
++	/* patch upgrade ref counting - only do exit the last time */
++	refcount = klp_shadow_get(NULL, KLP_SHADOW_CPU_BUGS_COUNT);
++	if (WARN_ON(!refcount))
++		return;
++	(*refcount)--;
++	if (*refcount > 0)
++		return;
++
++	kpatch_exit_itlb_multihit_sysfs();
++	kpatch_exit_kpatch_itlb_multihit_kvm_mitigation();
++	kpatch_exit_boot_cpu_bug_ifu();
++	klp_shadow_free(NULL, KLP_SHADOW_CPU_BUGS_COUNT, NULL);
++}
++
++
+ static int kpatch_vmlinux_pre_patch_callback(struct klp_object *obj)
+ {
+-	return kpatch_taa_pre_patch();
++	int ret;
++	ret = kpatch_taa_pre_patch();
++	if (ret)
++		return ret;
++
++	ret = kpatch_ifu_pre_patch();
++	if (ret) {
++		kpatch_taa_post_unpatch();
++		return ret;
++	}
++
++	return 0;
++
+ }
+ KPATCH_PRE_PATCH_CALLBACK(kpatch_vmlinux_pre_patch_callback);
+ 
+ static void kpatch_vmlinux_post_unpatch_callback(struct klp_object *obj)
+ {
++	kpatch_ifu_post_unpatch();
+ 	kpatch_taa_post_unpatch();
+ }
+ KPATCH_POST_UNPATCH_CALLBACK(kpatch_vmlinux_post_unpatch_callback);
+diff --git a/arch/x86/kernel/cpu/proc.c b/arch/x86/kernel/cpu/proc.c
+index b4c50bc061e0..bb5e2c2c0d62 100644
+--- a/arch/x86/kernel/cpu/proc.c
++++ b/arch/x86/kernel/cpu/proc.c
+@@ -56,6 +56,7 @@ static void show_cpuinfo_misc(struct seq_file *m, struct cpuinfo_x86 *c)
+ 
+ #include <linux/kpatch_taa.h>
+ 
++#include <linux/klp_2018_12207.h>
+ static int show_cpuinfo(struct seq_file *m, void *v)
+ {
+ 	struct cpuinfo_x86 *c = v;
+@@ -112,6 +113,9 @@ static int show_cpuinfo(struct seq_file *m, void *v)
+ 			seq_printf(m, " %s", x86_bug_flags[i]);
+ 		else if (bug_bit == X86_BUG_TAA && boot_cpu_has_bug(X86_BUG_TAA))
+ 			seq_printf(m, " taa");
++		else if (bug_bit == X86_BUG_ITLB_MULTIHIT &&
++			 boot_cpu_has_bug(X86_BUG_ITLB_MULTIHIT))
++			seq_printf(m, " itlb_multihit");
+ 	}
+ 
+ 	seq_printf(m, "\nbogomips\t: %lu.%02lu\n",
+diff --git a/arch/x86/kvm/mmu.c b/arch/x86/kvm/mmu.c
+index 55dcdd312017..848572fa9e0b 100644
+--- a/arch/x86/kvm/mmu.c
++++ b/arch/x86/kvm/mmu.c
+@@ -49,6 +49,9 @@
+ #include <asm/kvm_page_track.h>
+ #include "trace.h"
+ 
++#include <linux/klp_2018_12207.h>
++#include "kpatch-macros.h"
++
+ /*
+  * When setting this variable to true it enables Two-Dimensional-Paging
+  * where the hardware walks 2 page tables:
+@@ -314,6 +317,22 @@ static inline bool spte_ad_enabled(u64 spte)
+ 	return !(spte & shadow_acc_track_value);
+ }
+ 
++/*
++ * kpatch note: use itlb_multihit_kvm_mitigation directly in lieu of
++ * nx_huge_pages since we can't use the latter as a module parameter
++ */
++static bool is_nx_huge_page_enabled(void)
++{
++	int *kpatch_itlb_multihit_kvm_mitigation;
++
++	kpatch_itlb_multihit_kvm_mitigation =
++		klp_shadow_get(NULL, KLP_SHADOW_KVM_MITIGATION);
++	if (WARN_ON(!kpatch_itlb_multihit_kvm_mitigation))
++		return false;
++
++	return READ_ONCE(*kpatch_itlb_multihit_kvm_mitigation);
++}
++
+ static inline u64 spte_shadow_accessed_mask(u64 spte)
+ {
+ 	MMU_WARN_ON((spte & shadow_mmio_mask) == shadow_mmio_value);
+@@ -2925,6 +2944,11 @@ static int set_spte(struct kvm_vcpu *vcpu, u64 *sptep,
+ 	if (!speculative)
+ 		spte |= spte_shadow_accessed_mask(spte);
+ 
++	if (level > PT_PAGE_TABLE_LEVEL && (pte_access & ACC_EXEC_MASK) &&
++	    is_nx_huge_page_enabled()) {
++		pte_access &= ~ACC_EXEC_MASK;
++	}
++
+ 	if (pte_access & ACC_EXEC_MASK)
+ 		spte |= shadow_x_mask;
+ 	else
+@@ -3148,40 +3172,65 @@ static void direct_pte_prefetch(struct kvm_vcpu *vcpu, u64 *sptep)
+ 	__direct_pte_prefetch(vcpu, sp, sptep);
+ }
+ 
+-static int __direct_map(struct kvm_vcpu *vcpu, int write, int map_writable,
+-			int level, gfn_t gfn, kvm_pfn_t pfn, bool prefault)
++static void disallowed_hugepage_adjust(struct kvm_shadow_walk_iterator it,
++				       gfn_t gfn, kvm_pfn_t *pfnp, int *levelp)
+ {
+-	struct kvm_shadow_walk_iterator iterator;
+-	struct kvm_mmu_page *sp;
+-	int emulate = 0;
+-	gfn_t pseudo_gfn;
++	int level = *levelp;
++	u64 spte = *it.sptep;
+ 
+-	if (!VALID_PAGE(vcpu->arch.mmu->root_hpa))
+-		return 0;
++	if (it.level == level && level > PT_PAGE_TABLE_LEVEL &&
++	    is_nx_huge_page_enabled() &&
++	    is_shadow_present_pte(spte) &&
++	    !is_large_pte(spte)) {
++		/*
++		 * A small SPTE exists for this pfn, but FNAME(fetch)
++		 * and __direct_map would like to create a large PTE
++		 * instead: just force them to go down another level,
++		 * patching back for them into pfn the next 9 bits of
++		 * the address.
++		 */
++		u64 page_mask = KVM_PAGES_PER_HPAGE(level) - KVM_PAGES_PER_HPAGE(level - 1);
++		*pfnp |= gfn & page_mask;
++		(*levelp)--;
++	}
++}
+ 
+-	for_each_shadow_entry(vcpu, (u64)gfn << PAGE_SHIFT, iterator) {
+-		if (iterator.level == level) {
+-			emulate = mmu_set_spte(vcpu, iterator.sptep, ACC_ALL,
+-					       write, level, gfn, pfn, prefault,
+-					       map_writable);
+-			direct_pte_prefetch(vcpu, iterator.sptep);
+-			++vcpu->stat.pf_fixed;
+-			break;
+-		}
++static int __direct_map(struct kvm_vcpu *vcpu, gpa_t gpa, int write,
++			int map_writable, int level, kvm_pfn_t pfn,
++			bool prefault, bool lpage_disallowed)
++{
++	struct kvm_shadow_walk_iterator it;
++	struct kvm_mmu_page *sp;
++	int ret;
++	gfn_t gfn = gpa >> PAGE_SHIFT;
++	gfn_t base_gfn = gfn;
+ 
+-		drop_large_spte(vcpu, iterator.sptep);
+-		if (!is_shadow_present_pte(*iterator.sptep)) {
+-			u64 base_addr = iterator.addr;
++	if (!VALID_PAGE(vcpu->arch.mmu->root_hpa))
++		return RET_PF_RETRY;
+ 
+-			base_addr &= PT64_LVL_ADDR_MASK(iterator.level);
+-			pseudo_gfn = base_addr >> PAGE_SHIFT;
+-			sp = kvm_mmu_get_page(vcpu, pseudo_gfn, iterator.addr,
+-					      iterator.level - 1, 1, ACC_ALL);
++	for_each_shadow_entry(vcpu, gpa, it) {
++		/*
++		 * We cannot overwrite existing page tables with an NX
++		 * large page, as the leaf could be executable.
++		 */
++		disallowed_hugepage_adjust(it, gfn, &pfn, &level);
+ 
+-			link_shadow_page(vcpu, iterator.sptep, sp);
++		base_gfn = gfn & ~(KVM_PAGES_PER_HPAGE(it.level) - 1);
++		if (it.level == level)
++			break;
++		drop_large_spte(vcpu, it.sptep);
++		if (!is_shadow_present_pte(*it.sptep)) {
++			sp = kvm_mmu_get_page(vcpu, base_gfn, it.addr,
++					      it.level - 1, true, ACC_ALL);
++			link_shadow_page(vcpu, it.sptep, sp);
+ 		}
+ 	}
+-	return emulate;
++	ret = mmu_set_spte(vcpu, it.sptep, ACC_ALL,
++			   write, level, base_gfn, pfn, prefault,
++			   map_writable);
++	direct_pte_prefetch(vcpu, it.sptep);
++	++vcpu->stat.pf_fixed;
++	return ret;
+ }
+ 
+ static void kvm_send_hwpoison_signal(unsigned long address, struct task_struct *tsk)
+@@ -3467,11 +3516,14 @@ static int nonpaging_map(struct kvm_vcpu *vcpu, gva_t v, u32 error_code,
+ {
+ 	int r;
+ 	int level;
+-	bool force_pt_level = false;
++	bool force_pt_level;
+ 	kvm_pfn_t pfn;
+ 	unsigned long mmu_seq;
+ 	bool map_writable, write = error_code & PFERR_WRITE_MASK;
++	bool lpage_disallowed = (error_code & PFERR_FETCH_MASK) &&
++				is_nx_huge_page_enabled();
+ 
++	force_pt_level = lpage_disallowed;
+ 	level = mapping_level(vcpu, gfn, &force_pt_level);
+ 	if (likely(!force_pt_level)) {
+ 		/*
+@@ -3504,7 +3556,8 @@ static int nonpaging_map(struct kvm_vcpu *vcpu, gva_t v, u32 error_code,
+ 		goto out_unlock;
+ 	if (likely(!force_pt_level))
+ 		transparent_hugepage_adjust(vcpu, &gfn, &pfn, &level);
+-	r = __direct_map(vcpu, write, map_writable, level, gfn, pfn, prefault);
++	r = __direct_map(vcpu, v, write, map_writable, level, pfn,
++			 prefault, false);
+ 	spin_unlock(&vcpu->kvm->mmu_lock);
+ 
+ 	return r;
+@@ -4107,6 +4160,8 @@ static int tdp_page_fault(struct kvm_vcpu *vcpu, gva_t gpa, u32 error_code,
+ 	unsigned long mmu_seq;
+ 	int write = error_code & PFERR_WRITE_MASK;
+ 	bool map_writable;
++	bool lpage_disallowed = (error_code & PFERR_FETCH_MASK) &&
++				is_nx_huge_page_enabled();
+ 
+ 	MMU_WARN_ON(!VALID_PAGE(vcpu->arch.mmu->root_hpa));
+ 
+@@ -4117,8 +4172,9 @@ static int tdp_page_fault(struct kvm_vcpu *vcpu, gva_t gpa, u32 error_code,
+ 	if (r)
+ 		return r;
+ 
+-	force_pt_level = !check_hugepage_cache_consistency(vcpu, gfn,
+-							   PT_DIRECTORY_LEVEL);
++	force_pt_level =
++		lpage_disallowed ||
++		!check_hugepage_cache_consistency(vcpu, gfn, PT_DIRECTORY_LEVEL);
+ 	level = mapping_level(vcpu, gfn, &force_pt_level);
+ 	if (likely(!force_pt_level)) {
+ 		if (level > PT_DIRECTORY_LEVEL &&
+@@ -4146,7 +4202,8 @@ static int tdp_page_fault(struct kvm_vcpu *vcpu, gva_t gpa, u32 error_code,
+ 		goto out_unlock;
+ 	if (likely(!force_pt_level))
+ 		transparent_hugepage_adjust(vcpu, &gfn, &pfn, &level);
+-	r = __direct_map(vcpu, write, map_writable, level, gfn, pfn, prefault);
++	r = __direct_map(vcpu, gpa, write, map_writable, level, pfn,
++			 prefault, lpage_disallowed);
+ 	spin_unlock(&vcpu->kvm->mmu_lock);
+ 
+ 	return r;
+@@ -6071,3 +6128,189 @@ void kvm_mmu_module_exit(void)
+ 	unregister_shrinker(&mmu_shrinker);
+ 	mmu_audit_disable();
+ }
++
++/*
++ * Call our version of cpu_mitigations_off() which has access to
++ * non-exported cpu_mitigations variable.
++ */
++static bool get_nx_auto_mode(void)
++{
++	/* Return true when CPU has the bug, and mitigations are ON */
++	return boot_cpu_has_bug(X86_BUG_ITLB_MULTIHIT) && !kpatch_cpu_mitigations_off();
++}
++
++/*
++ * kpatch doesn't need nx_huge_pages, but does keep its own
++ * itlb_multihit_kvm_mitigation variable stored in
++ * KLP_SHADOW_KVM_MITIGATION.  This controls the kvm-side of the IFU
++ * mitigation.
++ */
++static void __set_nx_huge_pages(bool val)
++{
++	int *kpatch_itlb_multihit_kvm_mitigation;
++
++	kpatch_itlb_multihit_kvm_mitigation =
++		klp_shadow_get(NULL, KLP_SHADOW_KVM_MITIGATION);
++	if (WARN_ON(!kpatch_itlb_multihit_kvm_mitigation))
++		return;
++
++	if (val)
++		pr_info("IFU: Enabling iTLB multihit (IFU) mitigation\n");
++	else
++		pr_info("IFU: Disabling iTLB multihit (IFU) mitigation\n");
++
++	*kpatch_itlb_multihit_kvm_mitigation = val;
++}
++
++/*
++ * Mimic the original IFU patchset's set_nx_huge_pages(), which was
++ * called when setting kvm's nx_huge_pages module parameter.  Here we
++ * implement nx_huge_pages=auto and call kvm_mmu_zap_all() instead of
++ * kvm_mmu_zap_all_fast().  The initial value of -1 is restored on
++ * kpatch unload.
++ *
++ * KLP_SHADOW_KVM_MUTEX only needs to be updated on the first kvm kpatch
++ * is loaded and the last unloaded.
++ */
++static void kpatch_init_nx_huge_pages(void)
++{
++	struct mutex *kpatch_kvm_mutex;
++	struct kvm *kvm;
++	int idx;
++
++	kpatch_kvm_mutex = klp_shadow_get(NULL, KLP_SHADOW_KVM_MUTEX);
++	WARN_ON(!kpatch_kvm_mutex);
++
++	__set_nx_huge_pages(get_nx_auto_mode());
++
++	if (kpatch_kvm_mutex)
++		mutex_lock(kpatch_kvm_mutex);
++
++	list_for_each_entry(kvm, &vm_list, vm_list) {
++		idx = srcu_read_lock(&kvm->srcu);
++		kvm_mmu_zap_all(kvm);
++		srcu_read_unlock(&kvm->srcu, idx);
++	}
++	if (kpatch_kvm_mutex)
++		mutex_unlock(kpatch_kvm_mutex);
++}
++
++static void kpatch_exit_nx_huge_pages(void)
++{
++	int *kpatch_itlb_multihit_kvm_mitigation;
++
++	kpatch_itlb_multihit_kvm_mitigation =
++		klp_shadow_get(NULL, KLP_SHADOW_KVM_MITIGATION);
++	if (WARN_ON(!kpatch_itlb_multihit_kvm_mitigation))
++		return;
++
++	if (*kpatch_itlb_multihit_kvm_mitigation == 1)
++		pr_info("IFU: Disabling iTLB multihit (IFU) mitigation\n");
++	*kpatch_itlb_multihit_kvm_mitigation = -1;
++}
++
++/*
++ * kpatch_kvm_mutex implements the original patchset's kvm_mutex.  The
++ * mutex is saved across kpatch upgrades through KLP_SHADOW_KVM_MUTEX,
++ * so it only needs to be initialized once on the first kvm kpatch load
++ * and the shadow variable freed on last exit.
++ */
++static int kpatch_init_kpatch_kvm_mutex(void)
++{
++	struct mutex *kpatch_kvm_mutex;
++
++	kpatch_kvm_mutex = klp_shadow_alloc(NULL, KLP_SHADOW_KVM_MUTEX,
++					sizeof(*kpatch_kvm_mutex), GFP_KERNEL,
++					NULL, NULL);
++	if (WARN_ON(!kpatch_kvm_mutex))
++		return -ENOMEM;
++
++	mutex_init(kpatch_kvm_mutex);
++
++	return 0;
++}
++
++static void kpatch_exit_kpatch_kvm_mutex(void)
++{
++	klp_shadow_free(NULL, KLP_SHADOW_KVM_MUTEX, NULL);
++}
++
++
++/*
++ * kpatch pre-patch and post-unpatch handlers
++ */
++static int kpatch_ifu_pre_patch_kvm_mmu(patch_object *obj)
++{
++	int *refcount;
++	int ret;
++
++	/* patch upgrade ref counting - only do init the first time */
++	refcount = klp_shadow_get(NULL, KLP_SHADOW_KVM_COUNT);
++	if (refcount) {
++		(*refcount)++;
++		return 0;
++	}
++	refcount = klp_shadow_alloc(NULL, KLP_SHADOW_KVM_COUNT,
++				    sizeof(*refcount), GFP_KERNEL,
++				    NULL, NULL);
++	if (WARN_ON(!refcount))
++		return -ENOMEM;
++
++	(*refcount) = 1;
++
++	ret = kpatch_init_kpatch_kvm_mutex();
++	if (ret)
++		goto err;
++
++	return 0;
++
++err:
++	klp_shadow_free(NULL, KLP_SHADOW_KVM_COUNT, NULL);
++	return ret;
++}
++KPATCH_PRE_PATCH_CALLBACK(kpatch_ifu_pre_patch_kvm_mmu);
++
++static void kpatch_ifu_post_patch_kvm_mmu(struct klp_object *obj)
++{
++	int *refcount;
++
++	refcount = klp_shadow_get(NULL, KLP_SHADOW_KVM_COUNT);
++	if (WARN_ON(!refcount))
++		return;
++	if (*refcount > 1)
++		return;
++
++	kpatch_init_nx_huge_pages();
++
++}
++KPATCH_POST_PATCH_CALLBACK(kpatch_ifu_post_patch_kvm_mmu);
++
++static void kpatch_ifu_pre_unpatch_kvm_mmu(struct klp_object *obj)
++{
++	int *refcount;
++
++	refcount = klp_shadow_get(NULL, KLP_SHADOW_KVM_COUNT);
++	if (WARN_ON(!refcount))
++		return;
++	if (*refcount > 1)
++		return;
++
++	kpatch_exit_nx_huge_pages();
++}
++KPATCH_PRE_UNPATCH_CALLBACK(kpatch_ifu_pre_unpatch_kvm_mmu);
++
++static void kpatch_ifu_post_unpatch_kvm_mmu(struct klp_object *obj)
++{
++	int *refcount;
++
++	refcount = klp_shadow_get(NULL, KLP_SHADOW_KVM_COUNT);
++	if (WARN_ON(!refcount))
++		return;
++	(*refcount)--;
++	if (*refcount > 0)
++		return;
++
++	kpatch_exit_kpatch_kvm_mutex();
++	klp_shadow_free(NULL, KLP_SHADOW_KVM_COUNT, NULL);
++}
++KPATCH_POST_UNPATCH_CALLBACK(kpatch_ifu_post_unpatch_kvm_mmu);
+diff --git a/arch/x86/kvm/mmu_audit.c b/arch/x86/kvm/mmu_audit.c
+index abac7e208853..e6af91573314 100644
+--- a/arch/x86/kvm/mmu_audit.c
++++ b/arch/x86/kvm/mmu_audit.c
+@@ -257,6 +257,17 @@ static inline void kvm_mmu_audit(struct kvm_vcpu *vcpu, int point)
+ 		__kvm_mmu_audit(vcpu, point);
+ }
+ 
++/*
++ * kpatch note: avoid kpatch #940 ("Jump label support still cannot
++ * work") by callers in arch/x86/kvm/paging_tmpl.h :: FNAME(page_fault)
++ * functions.
++ */
++static inline void kpatch_kvm_mmu_audit(struct kvm_vcpu *vcpu, int point)
++{
++	if (static_key_enabled((&mmu_audit_key)))
++		__kvm_mmu_audit(vcpu, point);
++}
++
+ static void mmu_audit_enable(void)
+ {
+ 	if (mmu_audit)
+diff --git a/arch/x86/kvm/paging_tmpl.h b/arch/x86/kvm/paging_tmpl.h
+index 6bdca39829bc..988c971e1a90 100644
+--- a/arch/x86/kvm/paging_tmpl.h
++++ b/arch/x86/kvm/paging_tmpl.h
+@@ -602,6 +602,7 @@ static int FNAME(fetch)(struct kvm_vcpu *vcpu, gva_t addr,
+ 	struct kvm_shadow_walk_iterator it;
+ 	unsigned direct_access, access = gw->pt_access;
+ 	int top_level, ret;
++	gfn_t base_gfn;
+ 
+ 	direct_access = gw->pte_access;
+ 
+@@ -646,31 +647,29 @@ static int FNAME(fetch)(struct kvm_vcpu *vcpu, gva_t addr,
+ 			link_shadow_page(vcpu, it.sptep, sp);
+ 	}
+ 
+-	for (;
+-	     shadow_walk_okay(&it) && it.level > hlevel;
+-	     shadow_walk_next(&it)) {
+-		gfn_t direct_gfn;
++	base_gfn = gw->gfn;
+ 
++	for (; shadow_walk_okay(&it); shadow_walk_next(&it)) {
+ 		clear_sp_write_flooding_count(it.sptep);
++		base_gfn = gw->gfn & ~(KVM_PAGES_PER_HPAGE(it.level) - 1);
++		if (it.level == hlevel)
++			break;
++
+ 		validate_direct_spte(vcpu, it.sptep, direct_access);
+ 
+ 		drop_large_spte(vcpu, it.sptep);
+ 
+-		if (is_shadow_present_pte(*it.sptep))
+-			continue;
+-
+-		direct_gfn = gw->gfn & ~(KVM_PAGES_PER_HPAGE(it.level) - 1);
+-
+-		sp = kvm_mmu_get_page(vcpu, direct_gfn, addr, it.level-1,
+-				      true, direct_access);
+-		link_shadow_page(vcpu, it.sptep, sp);
++		if (!is_shadow_present_pte(*it.sptep)) {
++			sp = kvm_mmu_get_page(vcpu, base_gfn, addr,
++					      it.level - 1, true, direct_access);
++			link_shadow_page(vcpu, it.sptep, sp);
++		}
+ 	}
+ 
+-	clear_sp_write_flooding_count(it.sptep);
+ 	ret = mmu_set_spte(vcpu, it.sptep, gw->pte_access, write_fault,
+-			   it.level, gw->gfn, pfn, prefault, map_writable);
++			   it.level, base_gfn, pfn, prefault, map_writable);
+ 	FNAME(pte_prefetch)(vcpu, gw, it.sptep);
+-
++	++vcpu->stat.pf_fixed;
+ 	return ret;
+ 
+ out_gpte_changed:
+@@ -826,15 +825,14 @@ static int FNAME(page_fault)(struct kvm_vcpu *vcpu, gva_t addr, u32 error_code,
+ 	if (mmu_notifier_retry(vcpu->kvm, mmu_seq))
+ 		goto out_unlock;
+ 
+-	kvm_mmu_audit(vcpu, AUDIT_PRE_PAGE_FAULT);
++	kpatch_kvm_mmu_audit(vcpu, AUDIT_PRE_PAGE_FAULT);
+ 	if (make_mmu_pages_available(vcpu) < 0)
+ 		goto out_unlock;
+ 	if (!force_pt_level)
+ 		transparent_hugepage_adjust(vcpu, &walker.gfn, &pfn, &level);
+ 	r = FNAME(fetch)(vcpu, addr, &walker, write_fault,
+ 			 level, pfn, map_writable, prefault);
+-	++vcpu->stat.pf_fixed;
+-	kvm_mmu_audit(vcpu, AUDIT_POST_PAGE_FAULT);
++	kpatch_kvm_mmu_audit(vcpu, AUDIT_POST_PAGE_FAULT);
+ 	spin_unlock(&vcpu->kvm->mmu_lock);
+ 
+ 	return r;
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index 571313a87665..abd911c8ca10 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -1209,12 +1209,21 @@ static u32 msr_based_features[] = {
+ 
+ static unsigned int num_msr_based_features;
+ 
++#include <linux/klp_2018_12207.h>
+ u64 kvm_get_arch_capabilities(void)
+ {
+ 	u64 data;
+ 
+ 	rdmsrl_safe(MSR_IA32_ARCH_CAPABILITIES, &data);
+ 
++	/*
++	 * If nx_huge_pages is enabled, KVM's shadow paging will ensure that
++	 * the nested hypervisor runs with NX huge pages.  If it is not,
++	 * L1 is anyway vulnerable to ITLB_MULTIHIT explots from other
++	 * L1 guests, so it need not worry about its own (L2) guests.
++	 */
++	data |= ARCH_CAP_PSCHANGE_MC_NO;
++
+ 	/*
+ 	 * If we're doing cache flushes (either "always" or "cond")
+ 	 * we will do one whenever the guest does a vmlaunch/vmresume.
+diff --git a/include/linux/klp_2018_12207.h b/include/linux/klp_2018_12207.h
+new file mode 100644
+index 000000000000..2f852037291d
+--- /dev/null
++++ b/include/linux/klp_2018_12207.h
+@@ -0,0 +1,42 @@
++#ifndef _KLP_2018_12207_H_
++#define _KLP_2018_12207_H_
++
++#ifndef CONFIG_X86_64
++/* CVE-2018-11207 is x86-64 specific */
++#else
++
++#define KPATCH_CVE_2018_11207
++
++#include <linux/livepatch.h>
++
++/* vmlinux :: cpu/bugs.c patch hook refcounter */
++#define KLP_SHADOW_CPU_BUGS_COUNT	0x2018122070000000
++
++/* kvm :: arch/x86/kvm/mmu.c patch hook refcounter */
++#define KLP_SHADOW_KVM_COUNT		0x2018122070000001
++
++/* kpatch_itlb_multihit_kvm_mitigation */
++#define KLP_SHADOW_KVM_MITIGATION	0x2018122070000010
++
++/* kpatch_kvm_mutex */
++#define KLP_SHADOW_KVM_MUTEX		0x2018122070000011
++
++/*
++ * Avoid modifying arch/x86/include/asm/msr-index.h and rebuilding all
++ * includers.
++ */
++#define ARCH_CAP_PSCHANGE_MC_NO		BIT(6)	 /*
++						  * The processor is not susceptible to a
++						  * machine check error due to modifying the
++						  * code page size along with either the
++						  * physical address or cache type
++						  * without TLB invalidation.
++						  */
++
++#define X86_BUG_ITLB_MULTIHIT		X86_BUG(23) /* CPU may incur MCE during certain page attribute changes */
++
++bool kpatch_boot_cpu_has_itlb_multihit_bug(void);
++bool kpatch_cpu_mitigations_off(void);
++
++#endif /* CONFIG_X86_64 */
++#endif /* _KLP_2018_12207_H_ */
+diff --git a/virt/kvm/kvm_main.c b/virt/kvm/kvm_main.c
+index 5cb1099e62c3..3d2756cef081 100644
+--- a/virt/kvm/kvm_main.c
++++ b/virt/kvm/kvm_main.c
+@@ -58,6 +58,8 @@
+ #include <linux/uaccess.h>
+ #include <asm/pgtable.h>
+ 
++#include <linux/klp_2018_12207.h>
++
+ #include "coalesced_mmio.h"
+ #include "async_pf.h"
+ #include "vfio.h"
+@@ -628,6 +630,13 @@ static struct kvm *kvm_create_vm(unsigned long type)
+ {
+ 	int r, i;
+ 	struct kvm *kvm = kvm_arch_alloc_vm();
++#ifdef KPATCH_CVE_2018_11207
++	struct mutex *kpatch_kvm_mutex;
++
++	kpatch_kvm_mutex = klp_shadow_get(NULL, KLP_SHADOW_KVM_MUTEX);
++	if (WARN_ON(!kpatch_kvm_mutex))
++		return ERR_PTR(-EINVAL);
++#endif
+ 
+ 	if (!kvm)
+ 		return ERR_PTR(-ENOMEM);
+@@ -681,9 +690,15 @@ static struct kvm *kvm_create_vm(unsigned long type)
+ 	if (r)
+ 		goto out_err;
+ 
++#ifdef KPATCH_CVE_2018_11207
++	mutex_lock(kpatch_kvm_mutex);
++#endif
+ 	spin_lock(&kvm_lock);
+ 	list_add(&kvm->vm_list, &vm_list);
+ 	spin_unlock(&kvm_lock);
++#ifdef KPATCH_CVE_2018_11207
++	mutex_unlock(kpatch_kvm_mutex);
++#endif
+ 
+ 	preempt_notifier_inc();
+ 
+@@ -725,13 +740,27 @@ static void kvm_destroy_vm(struct kvm *kvm)
+ {
+ 	int i;
+ 	struct mm_struct *mm = kvm->mm;
++#ifdef KPATCH_CVE_2018_11207
++	struct mutex *kpatch_kvm_mutex;
++
++	kpatch_kvm_mutex = klp_shadow_get(NULL, KLP_SHADOW_KVM_MUTEX);
++	WARN_ON(!kpatch_kvm_mutex);
++#endif
+ 
+ 	kvm_uevent_notify_change(KVM_EVENT_DESTROY_VM, kvm);
+ 	kvm_destroy_vm_debugfs(kvm);
+ 	kvm_arch_sync_events(kvm);
++#ifdef KPATCH_CVE_2018_11207
++	if (kpatch_kvm_mutex)
++		mutex_lock(kpatch_kvm_mutex);
++#endif
+ 	spin_lock(&kvm_lock);
+ 	list_del(&kvm->vm_list);
+ 	spin_unlock(&kvm_lock);
++#ifdef KPATCH_CVE_2018_11207
++	if (kpatch_kvm_mutex)
++		mutex_unlock(kpatch_kvm_mutex);
++#endif
+ 	kvm_free_irq_routing(kvm);
+ 	for (i = 0; i < KVM_NR_BUSES; i++) {
+ 		struct kvm_io_bus *bus = kvm_get_bus(kvm, i);
+-- 
+2.21.0
+
