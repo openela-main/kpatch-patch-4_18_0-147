@@ -1,0 +1,33 @@
+From 36120b9b08ec63242920622e796658e816af35f7 Mon Sep 17 00:00:00 2001
+From: Artem Savkov <asavkov@redhat.com>
+Date: Thu, 22 Aug 2019 11:47:52 +0200
+Subject: [PATCH] kmod/patch: check for RHEL8 when setting HAVE_SIMPLE_ENABLE
+
+Make sure we don't set HAVE_SIMPLE_ENABLE on rhel8 before rhel8.2
+
+Fixes: b913b4b ("livepatch-patch-hook: skip klp_(un)register_patch() for RHEL-7.8+ kernels")
+Fixes: #1031
+
+Signed-off-by: Artem Savkov <asavkov@redhat.com>
+---
+ kmod/patch/livepatch-patch-hook.c | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/kmod/patch/livepatch-patch-hook.c b/kmod/patch/livepatch-patch-hook.c
+index 2ddd153..e12fd50 100644
+--- a/kmod/patch/livepatch-patch-hook.c
++++ b/kmod/patch/livepatch-patch-hook.c
+@@ -65,7 +65,9 @@
+ #endif
+ 
+ #ifdef RHEL_RELEASE_CODE
+-# if RHEL_RELEASE_CODE >= RHEL_RELEASE_VERSION(7, 8)
++# if (RHEL_RELEASE_CODE >= RHEL_RELEASE_VERSION(7, 8) && 		\
++	 RHEL_RELEASE_CODE < RHEL_RELEASE_VERSION(8, 0)) || 		\
++      RHEL_RELEASE_CODE >= RHEL_RELEASE_VERSION(8, 2)
+ #  define HAVE_SIMPLE_ENABLE
+ # endif
+ #elif LINUX_VERSION_CODE >= KERNEL_VERSION(5, 1, 0)
+-- 
+2.21.0
+

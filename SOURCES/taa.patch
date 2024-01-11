@@ -1,0 +1,572 @@
+From 2ff4516f247851bbf8cba41a5ab5fd8e7de123ce Mon Sep 17 00:00:00 2001
+Message-Id: <2ff4516f247851bbf8cba41a5ab5fd8e7de123ce.1574103821.git.jpoimboe@redhat.com>
+From: Josh Poimboeuf <jpoimboe@redhat.com>
+Date: Mon, 11 Nov 2019 15:31:16 -0600
+Subject: [PATCH] x86/speculation/taa: Add mitigation for TSX Async Abort
+
+Modifications:
+
+This is a kpatch port of the TAA patches.  It was basically written from
+scratch, with inspiration from the originals.
+
+No actual functions are being patched.  The two entry points are:
+
+- kpatch_taa_pre_patch_callback(), which is called when the patch module
+  is loaded; and
+
+- kpatch_taa_post_unpatch_callback(), which is called when the patch
+  module is disabled/removed (but note that removing a patch is rare and
+  unsupported).
+
+It has the following differences from the original patches:
+
+- There are no cmdline options and no way to disable TSX.
+
+- TAA is mitigated by default unless the user booted with
+  mitigations=off or mds=off.
+
+- Late microcode loading works.  Microcode can be loaded before or after
+  the kpatch, and sysfs reports the right message in both cases.  Either
+  way it attempts the VERW mitigation.
+
+commit 36293f49811ce56271bbf9e73bc842880ff9ffbd
+Author: Josh Poimboeuf <jpoimboe@redhat.com>
+Date:   Thu Oct 31 14:50:14 2019 -0400
+
+    [x86] x86/msr: Add the IA32_TSX_CTRL MSR
+
+    Message-id: <8b24ec8c06fa373d58590d05e01bcb6389e016d4.1572529810.git.jpoimboe@redhat.com>
+    Patchwork-id: 683
+    O-Subject: [TLP:RED RHEL8.1.z PATCH v2 1/9] x86/msr: Add the IA32_TSX_CTRL MSR
+    Bugzilla: 1766551
+    Z-Bugzilla: 1766550
+    CVE: CVE-2019-11135
+
+    commit c2955f270a84762343000f103e0640d29c7a96f3
+    Author: Pawan Gupta <pawan.kumar.gupta@linux.intel.com>
+    Date:   Wed Oct 23 10:45:50 2019 +0200
+
+        x86/msr: Add the IA32_TSX_CTRL MSR
+
+        Transactional Synchronization Extensions (TSX) may be used on certain
+        processors as part of a speculative side channel attack.  A microcode
+        update for existing processors that are vulnerable to this attack will
+        add a new MSR - IA32_TSX_CTRL to allow the system administrator the
+        option to disable TSX as one of the possible mitigations.
+
+        The CPUs which get this new MSR after a microcode upgrade are the ones
+        which do not set MSR_IA32_ARCH_CAPABILITIES.MDS_NO (bit 5) because those
+        CPUs have CPUID.MD_CLEAR, i.e., the VERW implementation which clears all
+        CPU buffers takes care of the TAA case as well.
+
+          [ Note that future processors that are not vulnerable will also
+            support the IA32_TSX_CTRL MSR. ]
+
+        Add defines for the new IA32_TSX_CTRL MSR and its bits.
+
+        TSX has two sub-features:
+
+        1. Restricted Transactional Memory (RTM) is an explicitly-used feature
+           where new instructions begin and end TSX transactions.
+        2. Hardware Lock Elision (HLE) is implicitly used when certain kinds of
+           "old" style locks are used by software.
+
+        Bit 7 of the IA32_ARCH_CAPABILITIES indicates the presence of the
+        IA32_TSX_CTRL MSR.
+
+        There are two control bits in IA32_TSX_CTRL MSR:
+
+          Bit 0: When set, it disables the Restricted Transactional Memory (RTM)
+                 sub-feature of TSX (will force all transactions to abort on the
+                 XBEGIN instruction).
+
+          Bit 1: When set, it disables the enumeration of the RTM and HLE feature
+                 (i.e. it will make CPUID(EAX=7).EBX{bit4} and
+                  CPUID(EAX=7).EBX{bit11} read as 0).
+
+        The other TSX sub-feature, Hardware Lock Elision (HLE), is
+        unconditionally disabled by the new microcode but still enumerated
+        as present by CPUID(EAX=7).EBX{bit4}, unless disabled by
+        IA32_TSX_CTRL_MSR[1] - TSX_CTRL_CPUID_CLEAR.
+
+        Signed-off-by: Pawan Gupta <pawan.kumar.gupta@linux.intel.com>
+        Signed-off-by: Borislav Petkov <bp@suse.de>
+        Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+        Tested-by: Neelima Krishnan <neelima.krishnan@intel.com>
+        Reviewed-by: Mark Gross <mgross@linux.intel.com>
+        Reviewed-by: Tony Luck <tony.luck@intel.com>
+        Reviewed-by: Josh Poimboeuf <jpoimboe@redhat.com>
+
+    Signed-off-by: Josh Poimboeuf <jpoimboe@redhat.com>
+    Signed-off-by: Frantisek Hrbata <fhrbata@redhat.com>
+
+commit 57b848fa3a57757e472af3d22291a3728fc6e37c
+Author: Josh Poimboeuf <jpoimboe@redhat.com>
+Date:   Thu Oct 31 14:50:15 2019 -0400
+
+    [x86] x86/cpu: Add a helper function x86_read_arch_cap_msr()
+
+    Message-id: <6adfcdd20ffb4ea0ed8016008cada62ec2ae5281.1572529810.git.jpoimboe@redhat.com>
+    Patchwork-id: 681
+    O-Subject: [TLP:RED RHEL8.1.z PATCH v2 2/9] x86/cpu: Add a helper function x86_read_arch_cap_msr()
+    Bugzilla: 1766551
+    Z-Bugzilla: 1766550
+    CVE: CVE-2019-11135
+
+    RHEL conflicts:
+    - Change the IFU code to use the new helper.
+
+    commit 286836a70433fb64131d2590f4bf512097c255e1
+    Author: Pawan Gupta <pawan.kumar.gupta@linux.intel.com>
+    Date:   Wed Oct 23 10:52:35 2019 +0200
+
+        x86/cpu: Add a helper function x86_read_arch_cap_msr()
+
+        Add a helper function to read the IA32_ARCH_CAPABILITIES MSR.
+
+        Signed-off-by: Pawan Gupta <pawan.kumar.gupta@linux.intel.com>
+        Signed-off-by: Borislav Petkov <bp@suse.de>
+        Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+        Tested-by: Neelima Krishnan <neelima.krishnan@intel.com>
+        Reviewed-by: Mark Gross <mgross@linux.intel.com>
+        Reviewed-by: Tony Luck <tony.luck@intel.com>
+        Reviewed-by: Josh Poimboeuf <jpoimboe@redhat.com>
+
+    Signed-off-by: Josh Poimboeuf <jpoimboe@redhat.com>
+    Signed-off-by: Frantisek Hrbata <fhrbata@redhat.com>
+
+commit fc547c047272ed79154668d5e6042ea0af309c62
+Author: Josh Poimboeuf <jpoimboe@redhat.com>
+Date:   Thu Oct 31 14:50:17 2019 -0400
+
+    [x86] x86/speculation/taa: Add mitigation for TSX Async Abort
+
+    Message-id: <95b46326314fd7f6f81ca48c2a4aa5f51d61e30a.1572529810.git.jpoimboe@redhat.com>
+    Patchwork-id: 685
+    O-Subject: [TLP:RED RHEL8.1.z PATCH v2 4/9] x86/speculation/taa: Add mitigation for TSX Async Abort
+    Bugzilla: 1766551
+    Z-Bugzilla: 1766550
+    CVE: CVE-2019-11135
+
+    RHEL conflicts:
+    - Add missing include of 'cpu.h' from upstream.
+    - Change X86_BUG_ITLB_MULTIHIT to X86_BUG(23).  Upstream will be doing
+      the same.
+
+    commit 1b42f017415b46c317e71d41c34ec088417a1883
+    Author: Pawan Gupta <pawan.kumar.gupta@linux.intel.com>
+    Date:   Wed Oct 23 11:30:45 2019 +0200
+
+        x86/speculation/taa: Add mitigation for TSX Async Abort
+
+        TSX Async Abort (TAA) is a side channel vulnerability to the internal
+        buffers in some Intel processors similar to Microachitectural Data
+        Sampling (MDS). In this case, certain loads may speculatively pass
+        invalid data to dependent operations when an asynchronous abort
+        condition is pending in a TSX transaction.
+
+        This includes loads with no fault or assist condition. Such loads may
+        speculatively expose stale data from the uarch data structures as in
+        MDS. Scope of exposure is within the same-thread and cross-thread. This
+        issue affects all current processors that support TSX, but do not have
+        ARCH_CAP_TAA_NO (bit 8) set in MSR_IA32_ARCH_CAPABILITIES.
+
+        On CPUs which have their IA32_ARCH_CAPABILITIES MSR bit MDS_NO=0,
+        CPUID.MD_CLEAR=1 and the MDS mitigation is clearing the CPU buffers
+        using VERW or L1D_FLUSH, there is no additional mitigation needed for
+        TAA. On affected CPUs with MDS_NO=1 this issue can be mitigated by
+        disabling the Transactional Synchronization Extensions (TSX) feature.
+
+        A new MSR IA32_TSX_CTRL in future and current processors after a
+        microcode update can be used to control the TSX feature. There are two
+        bits in that MSR:
+
+        * TSX_CTRL_RTM_DISABLE disables the TSX sub-feature Restricted
+        Transactional Memory (RTM).
+
+        * TSX_CTRL_CPUID_CLEAR clears the RTM enumeration in CPUID. The other
+        TSX sub-feature, Hardware Lock Elision (HLE), is unconditionally
+        disabled with updated microcode but still enumerated as present by
+        CPUID(EAX=7).EBX{bit4}.
+
+        The second mitigation approach is similar to MDS which is clearing the
+        affected CPU buffers on return to user space and when entering a guest.
+        Relevant microcode update is required for the mitigation to work.  More
+        details on this approach can be found here:
+
+          https://www.kernel.org/doc/html/latest/admin-guide/hw-vuln/mds.html
+
+        The TSX feature can be controlled by the "tsx" command line parameter.
+        If it is force-enabled then "Clear CPU buffers" (MDS mitigation) is
+        deployed. The effective mitigation state can be read from sysfs.
+
+         [ bp:
+           - massage + comments cleanup
+           - s/TAA_MITIGATION_TSX_DISABLE/TAA_MITIGATION_TSX_DISABLED/g - Josh.
+           - remove partial TAA mitigation in update_mds_branch_idle() - Josh.
+           - s/tsx_async_abort_cmdline/tsx_async_abort_parse_cmdline/g
+         ]
+
+        Signed-off-by: Pawan Gupta <pawan.kumar.gupta@linux.intel.com>
+        Signed-off-by: Borislav Petkov <bp@suse.de>
+        Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+        Reviewed-by: Josh Poimboeuf <jpoimboe@redhat.com>
+
+    Signed-off-by: Josh Poimboeuf <jpoimboe@redhat.com>
+    Signed-off-by: Frantisek Hrbata <fhrbata@redhat.com>
+
+commit 191684eb25ca16cb79b0cfd793ba8cfec0222fdf
+Author: Josh Poimboeuf <jpoimboe@redhat.com>
+Date:   Thu Oct 31 14:50:18 2019 -0400
+
+    [base] x86/speculation/taa: Add sysfs reporting for TSX Async Abort
+
+    Message-id: <5ac7fd4d2969d89ee4f684dee6b92a870989dbe2.1572529810.git.jpoimboe@redhat.com>
+    Patchwork-id: 684
+    O-Subject: [TLP:RED RHEL8.1.z PATCH v2 5/9] x86/speculation/taa: Add sysfs reporting for TSX Async Abort
+    Bugzilla: 1766551
+    Z-Bugzilla: 1766550
+    CVE: CVE-2019-11135
+
+    RHEL conflicts:
+    - The IFU+TAA RHEL patch application order is opposite from upstream, so
+      put TAA changes first.
+
+    commit 6608b45ac5ecb56f9e171252229c39580cc85f0f
+    Author: Pawan Gupta <pawan.kumar.gupta@linux.intel.com>
+    Date:   Wed Oct 23 12:19:51 2019 +0200
+
+        x86/speculation/taa: Add sysfs reporting for TSX Async Abort
+
+        Add the sysfs reporting file for TSX Async Abort. It exposes the
+        vulnerability and the mitigation state similar to the existing files for
+        the other hardware vulnerabilities.
+
+        Sysfs file path is:
+        /sys/devices/system/cpu/vulnerabilities/tsx_async_abort
+
+        Signed-off-by: Pawan Gupta <pawan.kumar.gupta@linux.intel.com>
+        Signed-off-by: Borislav Petkov <bp@suse.de>
+        Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+        Tested-by: Neelima Krishnan <neelima.krishnan@intel.com>
+        Reviewed-by: Mark Gross <mgross@linux.intel.com>
+        Reviewed-by: Tony Luck <tony.luck@intel.com>
+        Reviewed-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+        Reviewed-by: Josh Poimboeuf <jpoimboe@redhat.com>
+
+    Signed-off-by: Josh Poimboeuf <jpoimboe@redhat.com>
+    Signed-off-by: Frantisek Hrbata <fhrbata@redhat.com>
+
+Signed-off-by: Josh Poimboeuf <jpoimboe@redhat.com>
+Acked-by: Artem Savkov <asavkov@redhat.com>
+Acked-by: Waiman Long <longman@redhat.com>
+---
+ arch/x86/kernel/cpu/bugs.c | 258 +++++++++++++++++++++++++++++++++++++
+ arch/x86/kernel/cpu/proc.c |   4 +
+ include/linux/kpatch_taa.h |   6 +
+ 3 files changed, 268 insertions(+)
+ create mode 100644 include/linux/kpatch_taa.h
+
+diff --git a/arch/x86/kernel/cpu/bugs.c b/arch/x86/kernel/cpu/bugs.c
+index 12e99400de09..b1f2bbeeb72a 100644
+--- a/arch/x86/kernel/cpu/bugs.c
++++ b/arch/x86/kernel/cpu/bugs.c
+@@ -1470,3 +1470,261 @@ ssize_t cpu_show_mds(struct device *dev, struct device_attribute *attr, char *bu
+ 	return cpu_show_common(dev, attr, buf, X86_BUG_MDS);
+ }
+ #endif
++
++#include <linux/kpatch_taa.h>
++#include "kpatch-macros.h"
++
++#define KLP_SHADOW_TAA_DATA		0x2019111350000000
++
++#define ARCH_CAP_TSX_CTRL_MSR		BIT(7)	/* MSR for TSX control is available. */
++#define ARCH_CAP_TAA_NO			BIT(8)	/*
++						 * Not susceptible to
++						 * TSX Async Abort (TAA) vulnerabilities.
++						 */
++
++enum kpatch_taa_mitigation {
++	KPATCH_TAA_MITIGATION_DISABLED,
++	KPATCH_TAA_MITIGATION_ALREADY_ENABLED,
++	KPATCH_TAA_MITIGATION_ENABLED,
++};
++
++struct klp_taa_shadow_data {
++	int refcount;
++	enum kpatch_taa_mitigation mitigation;
++};
++
++static u64 x86_read_arch_cap_msr(void)
++{
++	u64 ia32_cap = 0;
++
++	if (boot_cpu_has(X86_FEATURE_ARCH_CAPABILITIES))
++		rdmsrl(MSR_IA32_ARCH_CAPABILITIES, ia32_cap);
++
++	return ia32_cap;
++}
++
++static bool kpatch_smt_enabled(void)
++{
++	/*
++	 * This is just like sched_smt_active(), except without jump labels,
++	 * which aren't supported by kpatch at the moment.
++	 */
++	return static_key_enabled(&sched_smt_present);
++}
++
++#define TAA_MSG_SMT "TAA CPU bug present and SMT on, data leak possible. See https://www.kernel.org/doc/html/latest/admin-guide/hw-vuln/tsx_async_abort.html for more details.\n"
++
++static enum kpatch_taa_mitigation kpatch_enable_taa_mitigation(void)
++{
++	u64 ia32_cap = x86_read_arch_cap_msr();
++
++	if (!(ia32_cap & ARCH_CAP_TAA_NO) &&
++	    (boot_cpu_has(X86_FEATURE_RTM) ||
++	     (ia32_cap & ARCH_CAP_TSX_CTRL_MSR)))
++		setup_force_cpu_bug(X86_BUG_TAA);
++
++	if (!boot_cpu_has_bug(X86_BUG_TAA)) {
++		pr_info("TAA: Not affected\n");
++		return KPATCH_TAA_MITIGATION_DISABLED;
++	}
++
++	/*
++	 * If the user turned off all mitigations, or they turned off the MDS
++	 * mitigation, we can assume they don't care about TAA either.
++	 */
++	if (cpu_mitigations_off()) {
++		pr_info("TAA: Mitigation disabled via cmdline (mitigations=off)\n");
++		return KPATCH_TAA_MITIGATION_DISABLED;
++	}
++	if (strstr(saved_command_line, "mds=off")) {
++		pr_info("TAA: Mitigation disabled via cmdline (mds=off)\n");
++		return KPATCH_TAA_MITIGATION_DISABLED;
++	}
++
++	/*
++	 * The MDS mitigation is the same as the TAA mitigation.  If the kernel
++	 * is already mitigating MDS, there's nothing left to do.
++	 */
++	if (mds_mitigation == MDS_MITIGATION_FULL ||
++	    mds_mitigation == MDS_MITIGATION_VMWERV) {
++		pr_info("TAA: Using existing MDS mitigation\n");
++		return KPATCH_TAA_MITIGATION_ALREADY_ENABLED;
++	}
++
++	/*
++	 * If we got here, we have a newer MDS_NO CPU which has TSX, e.g.
++	 * Cascade Lake.
++	 *
++	 * Note that if the user requested the disabling of SMT for MDS or
++	 * other mitigations (mds=full,nosmt or mitigations=auto,nosmt), we
++	 * still leave SMT enabled because disabling SMT at runtime is
++	 * disruptive and risky.  At least the TAA_MSG_SMT warning will be
++	 * printed.
++	 */
++
++	pr_info("TAA: Enabling TSX Async Abort (TAA) mitigation\n");
++
++	static_branch_enable(&mds_user_clear);
++
++	if (kpatch_smt_enabled())
++		pr_warn(TAA_MSG_SMT);
++
++	return KPATCH_TAA_MITIGATION_ENABLED;
++}
++
++static void kpatch_disable_taa_mitigation(enum kpatch_taa_mitigation mitigation)
++{
++	setup_clear_cpu_cap(X86_BUG_TAA);
++
++	if (mitigation != KPATCH_TAA_MITIGATION_ENABLED)
++		return;
++
++	pr_info("TAA: Disabling TSX Async Abort (TAA) mitigation\n");
++
++	static_branch_disable(&mds_user_clear);
++}
++
++static bool kpatch_cpu_needs_taa_ucode(void)
++{
++	u64 ia32_cap;
++
++	if (!boot_cpu_has(X86_FEATURE_MD_CLEAR))
++		return true;
++
++	if (!boot_cpu_has(X86_FEATURE_ARCH_CAPABILITIES))
++		return false;
++
++	rdmsrl(MSR_IA32_ARCH_CAPABILITIES, ia32_cap);
++
++	if ((ia32_cap & ARCH_CAP_MDS_NO) && !(ia32_cap & ARCH_CAP_TSX_CTRL_MSR))
++		return true;
++
++	return false;
++}
++
++static ssize_t kpatch_tsx_async_abort_show_state(struct device *dev,
++						 struct device_attribute *attr,
++						 char *buf)
++{
++	const char *mitigation, *smt;
++	struct klp_taa_shadow_data *data;
++
++	data = klp_shadow_get(NULL, KLP_SHADOW_TAA_DATA);
++	if (WARN_ON(!data))
++		return 0;
++
++	if (!boot_cpu_has_bug(X86_BUG_TAA))
++		return sprintf(buf, "Not affected\n");
++
++	if (data->mitigation == KPATCH_TAA_MITIGATION_DISABLED)
++		return sprintf(buf, "Vulnerable\n");
++
++	/*
++	 * Here we either have KPATCH_TAA_MITIGATION_ALREADY_ENABLED or
++	 * KPATCH_TAA_MITIGATION_ENABLED.  Either way we show the same
++	 * message in sysfs.
++	 *
++	 * The following microcode check is done dynamically so we don't have
++	 * to patch the late microcode function and do the same check in two
++	 * different places.
++	 */
++	if (kpatch_cpu_needs_taa_ucode())
++		mitigation = "Vulnerable: Clear CPU buffers attempted, no microcode";
++	else
++		mitigation = "Mitigation: Clear CPU buffers";
++
++	if (!hypervisor_is_type(X86_HYPER_NATIVE))
++		smt = "SMT Host state unknown";
++	else
++		smt = kpatch_smt_enabled() ?  "SMT vulnerable" : "SMT disabled";
++
++	return sprintf(buf, "%s; %s\n", mitigation, smt);
++}
++
++static DEVICE_ATTR(tsx_async_abort, 0444, kpatch_tsx_async_abort_show_state, NULL);
++
++static struct attribute *kpatch_sysfs_taa_attrs[] = {
++	&dev_attr_tsx_async_abort.attr,
++	NULL
++};
++
++static const struct attribute_group kpatch_sysfs_group = {
++	.name  = "vulnerabilities",
++	.attrs = kpatch_sysfs_taa_attrs,
++};
++
++static int kpatch_init_taa_sysfs(void)
++{
++	int ret;
++
++	ret = sysfs_merge_group(&cpu_subsys.dev_root->kobj,
++				&kpatch_sysfs_group);
++
++	if (ret)
++		pr_err("Unable to register TAA vulnerabilities sysfs entry\n");
++
++	return ret;
++}
++
++static void kpatch_exit_taa_sysfs(void)
++{
++	sysfs_unmerge_group(&cpu_subsys.dev_root->kobj, &kpatch_sysfs_group);
++}
++
++static int kpatch_taa_pre_patch(void)
++{
++	struct klp_taa_shadow_data *data;
++	int ret;
++
++	data = klp_shadow_get(NULL, KLP_SHADOW_TAA_DATA);
++	if (data) {
++		data->refcount++;
++		return 0;
++	}
++
++	data = klp_shadow_alloc(NULL, KLP_SHADOW_TAA_DATA, sizeof(*data),
++				GFP_KERNEL, NULL, NULL);
++	if (!data)
++		return -ENOMEM;
++
++	data->refcount = 1;
++	data->mitigation = kpatch_enable_taa_mitigation();
++
++	ret = kpatch_init_taa_sysfs();
++	if (ret) {
++		kpatch_disable_taa_mitigation(data->mitigation);
++		klp_shadow_free(NULL, KLP_SHADOW_TAA_DATA, NULL);
++		return ret;
++	}
++
++	return 0;
++}
++
++static void kpatch_taa_post_unpatch(void)
++{
++	struct klp_taa_shadow_data *data;
++
++	data = klp_shadow_get(NULL, KLP_SHADOW_TAA_DATA);
++	if (WARN_ON(!data))
++		return;
++
++	data->refcount--;
++	if (data->refcount > 0)
++		return;
++
++	kpatch_exit_taa_sysfs();
++	kpatch_disable_taa_mitigation(data->mitigation);
++	klp_shadow_free(NULL, KLP_SHADOW_TAA_DATA, NULL);
++}
++
++static int kpatch_vmlinux_pre_patch_callback(struct klp_object *obj)
++{
++	return kpatch_taa_pre_patch();
++}
++KPATCH_PRE_PATCH_CALLBACK(kpatch_vmlinux_pre_patch_callback);
++
++static void kpatch_vmlinux_post_unpatch_callback(struct klp_object *obj)
++{
++	kpatch_taa_post_unpatch();
++}
++KPATCH_POST_UNPATCH_CALLBACK(kpatch_vmlinux_post_unpatch_callback);
+diff --git a/arch/x86/kernel/cpu/proc.c b/arch/x86/kernel/cpu/proc.c
+index 2c8522a39ed5..b4c50bc061e0 100644
+--- a/arch/x86/kernel/cpu/proc.c
++++ b/arch/x86/kernel/cpu/proc.c
+@@ -54,6 +54,8 @@ static void show_cpuinfo_misc(struct seq_file *m, struct cpuinfo_x86 *c)
+ }
+ #endif
+ 
++#include <linux/kpatch_taa.h>
++
+ static int show_cpuinfo(struct seq_file *m, void *v)
+ {
+ 	struct cpuinfo_x86 *c = v;
+@@ -108,6 +110,8 @@ static int show_cpuinfo(struct seq_file *m, void *v)
+ 
+ 		if (cpu_has_bug(c, bug_bit) && x86_bug_flags[i])
+ 			seq_printf(m, " %s", x86_bug_flags[i]);
++		else if (bug_bit == X86_BUG_TAA && boot_cpu_has_bug(X86_BUG_TAA))
++			seq_printf(m, " taa");
+ 	}
+ 
+ 	seq_printf(m, "\nbogomips\t: %lu.%02lu\n",
+diff --git a/include/linux/kpatch_taa.h b/include/linux/kpatch_taa.h
+new file mode 100644
+index 000000000000..51e405a85651
+--- /dev/null
++++ b/include/linux/kpatch_taa.h
+@@ -0,0 +1,6 @@
++#ifndef _LINUX_KPATCH_TAA_H
++#define _LINUX_KPATCH_TAA_H
++
++#define X86_BUG_TAA			X86_BUG(22) /* CPU is affected by TSX Async Abort(TAA) */
++
++#endif /* _LINUX_KPATCH_TAA_H */
+-- 
+2.20.1
+

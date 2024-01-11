@@ -1,0 +1,279 @@
+From e353b4de9da5f2a1368a5d87f12def42170ccd7b Mon Sep 17 00:00:00 2001
+From: Joe Lawrence <joe.lawrence@redhat.com>
+Date: Tue, 3 Dec 2019 17:06:03 -0500
+Subject: [PATCH] kvm: Additional commits to address IFU vulnerability
+
+Changes since last build:
+arches: x86_64
+mmu.o: changed function: __direct_pte_prefetch
+mmu.o: changed function: ept_prefetch_gpte
+mmu.o: changed function: mmu_set_spte
+mmu.o: changed function: paging32_prefetch_gpte
+mmu.o: changed function: paging64_prefetch_gpte
+mmu.o: changed function: transparent_hugepage_adjust
+mmu.o: new function: __direct_map.constprop.139
+---------------------------
+
+Modifications:
+
+* Added inline functions kpatch_put_page() and
+  kpatch_put_devmap_managed_page() to use static_key_enabled() to avoid
+  avoid kpatch-build static key complaints in direct_pte_prefetch_many().
+
+commit 9e36b8113df75ae6e9c0f52280402f9c8b96ace8
+Author: Paolo Bonzini <pbonzini@redhat.com>
+Date:   Sat Nov 2 12:01:25 2019 -0400
+
+    [kvm] kvm: mmu: Do not release the page inside mmu_set_spte()
+
+    Message-id: <20191102120137.22750-6-pbonzini@redhat.com>
+    Patchwork-id: 801
+    O-Subject: [EMBARGOED RHEL8.1 PATCH v8 05/17] kvm: mmu: Do not release the page inside mmu_set_spte()
+    Bugzilla: 1690344
+    Z-Bugzilla: 1698416
+    CVE: CVE-2018-12207
+
+    From: Junaid Shahid <junaids@google.com>
+
+    Release the page at the call-site where it was originally acquired.
+    This makes the exit code cleaner for most call sites, since they
+    do not need to duplicate code between success and the failure
+    label.
+
+    Signed-off-by: Junaid Shahid <junaids@google.com>
+    Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+    (cherry picked from commit 43fdcda96e2550c6d1c46fb8a78801aa2f7276ed)
+    Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+    Signed-off-by: Frantisek Hrbata <fhrbata@redhat.com>
+
+commit 0226f6f2ff2f3594b97b5d99cb8157656e94f7c8
+Author: Paolo Bonzini <pbonzini@redhat.com>
+Date:   Sat Nov 2 12:01:27 2019 -0400
+
+    [kvm] KVM: x86: remove now unneeded hugepage gfn adjustment
+
+    Message-id: <20191102120137.22750-8-pbonzini@redhat.com>
+    Patchwork-id: 820
+    O-Subject: [EMBARGOED RHEL8.1 PATCH v8 07/17] KVM: x86: remove now unneeded hugepage gfn adjustment
+    Bugzilla: 1690344
+    Z-Bugzilla: 1698416
+    CVE: CVE-2018-12207
+
+    After the previous patch, the low bits of the gfn are masked in
+    both FNAME(fetch) and __direct_map, so we do not need to clear them
+    in transparent_hugepage_adjust.
+
+    Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+    (cherry picked from commit d679b32611c0102ce33b9e1a4e4b94854ed1812a)
+    Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+    Signed-off-by: Frantisek Hrbata <fhrbata@redhat.com>
+
+Signed-off-by: Joe Lawrence <joe.lawrence@redhat.com>
+---
+ arch/x86/kvm/mmu.c         | 69 ++++++++++++++++++++++++++++----------
+ arch/x86/kvm/paging_tmpl.h | 10 +++---
+ 2 files changed, 56 insertions(+), 23 deletions(-)
+
+diff --git a/arch/x86/kvm/mmu.c b/arch/x86/kvm/mmu.c
+index 848572fa9e0b..3afe6b0dcb28 100644
+--- a/arch/x86/kvm/mmu.c
++++ b/arch/x86/kvm/mmu.c
+@@ -3086,8 +3086,6 @@ static int mmu_set_spte(struct kvm_vcpu *vcpu, u64 *sptep, unsigned pte_access,
+ 		}
+ 	}
+ 
+-	kvm_release_pfn_clean(pfn);
+-
+ 	return ret;
+ }
+ 
+@@ -3103,6 +3101,48 @@ static kvm_pfn_t pte_prefetch_gfn_to_pfn(struct kvm_vcpu *vcpu, gfn_t gfn,
+ 	return gfn_to_pfn_memslot_atomic(slot, gfn);
+ }
+ 
++/*
++ * kpatch note: work around kpatch-build bug:
++ * ERROR: mmu.o: kpatch_regenerate_special_section: 2074: Found a jump
++ * label at __direct_pte_prefetch()+0x170, using key devmap_managed_key.
++ * Jump labels aren't currently supported.  Use static_key_enabled()
++ * instead.
++ */
++static inline bool kpatch_put_devmap_managed_page(struct page *page)
++{
++	if (!static_key_enabled(&devmap_managed_key))
++		return false;
++	if (!is_zone_device_page(page))
++		return false;
++	switch (page->pgmap->type) {
++	case MEMORY_DEVICE_PRIVATE:
++	case MEMORY_DEVICE_PUBLIC:
++	case MEMORY_DEVICE_FS_DAX:
++		__put_devmap_managed_page(page);
++		return true;
++	default:
++		break;
++	}
++	return false;
++}
++
++static inline void kpatch_put_page(struct page *page)
++{
++	page = compound_head(page);
++
++	/*
++	 * For devmap managed pages we need to catch refcount transition from
++	 * 2 to 1, when refcount reach one it means the page is free and we
++	 * need to inform the device driver through callback. See
++	 * include/linux/memremap.h and HMM for details.
++	 */
++	if (kpatch_put_devmap_managed_page(page))
++		return;
++
++	if (put_page_testzero(page))
++		__put_page(page);
++}
++
+ static int direct_pte_prefetch_many(struct kvm_vcpu *vcpu,
+ 				    struct kvm_mmu_page *sp,
+ 				    u64 *start, u64 *end)
+@@ -3122,9 +3162,11 @@ static int direct_pte_prefetch_many(struct kvm_vcpu *vcpu,
+ 	if (ret <= 0)
+ 		return -1;
+ 
+-	for (i = 0; i < ret; i++, gfn++, start++)
++	for (i = 0; i < ret; i++, gfn++, start++) {
+ 		mmu_set_spte(vcpu, start, access, 0, sp->role.level, gfn,
+ 			     page_to_pfn(pages[i]), true, true);
++		kpatch_put_page(pages[i]);
++	}
+ 
+ 	return 0;
+ }
+@@ -3257,11 +3299,10 @@ static int kvm_handle_bad_page(struct kvm_vcpu *vcpu, gfn_t gfn, kvm_pfn_t pfn)
+ }
+ 
+ static void transparent_hugepage_adjust(struct kvm_vcpu *vcpu,
+-					gfn_t *gfnp, kvm_pfn_t *pfnp,
++					gfn_t gfn, kvm_pfn_t *pfnp,
+ 					int *levelp)
+ {
+ 	kvm_pfn_t pfn = *pfnp;
+-	gfn_t gfn = *gfnp;
+ 	int level = *levelp;
+ 
+ 	/*
+@@ -3288,8 +3329,6 @@ static void transparent_hugepage_adjust(struct kvm_vcpu *vcpu,
+ 		mask = KVM_PAGES_PER_HPAGE(level) - 1;
+ 		VM_BUG_ON((gfn & mask) != (pfn & mask));
+ 		if (pfn & mask) {
+-			gfn &= ~mask;
+-			*gfnp = gfn;
+ 			kvm_release_pfn_clean(pfn);
+ 			pfn &= ~mask;
+ 			kvm_get_pfn(pfn);
+@@ -3549,23 +3588,21 @@ static int nonpaging_map(struct kvm_vcpu *vcpu, gva_t v, u32 error_code,
+ 	if (handle_abnormal_pfn(vcpu, v, gfn, pfn, ACC_ALL, &r))
+ 		return r;
+ 
++	r = RET_PF_RETRY;
+ 	spin_lock(&vcpu->kvm->mmu_lock);
+ 	if (mmu_notifier_retry(vcpu->kvm, mmu_seq))
+ 		goto out_unlock;
+ 	if (make_mmu_pages_available(vcpu) < 0)
+ 		goto out_unlock;
+ 	if (likely(!force_pt_level))
+-		transparent_hugepage_adjust(vcpu, &gfn, &pfn, &level);
++		transparent_hugepage_adjust(vcpu, gfn, &pfn, &level);
+ 	r = __direct_map(vcpu, v, write, map_writable, level, pfn,
+ 			 prefault, false);
+-	spin_unlock(&vcpu->kvm->mmu_lock);
+-
+-	return r;
+ 
+ out_unlock:
+ 	spin_unlock(&vcpu->kvm->mmu_lock);
+ 	kvm_release_pfn_clean(pfn);
+-	return RET_PF_RETRY;
++	return r;
+ }
+ 
+ static void mmu_free_root_page(struct kvm *kvm, hpa_t *root_hpa,
+@@ -4195,23 +4232,21 @@ static int tdp_page_fault(struct kvm_vcpu *vcpu, gva_t gpa, u32 error_code,
+ 	if (handle_abnormal_pfn(vcpu, 0, gfn, pfn, ACC_ALL, &r))
+ 		return r;
+ 
++	r = RET_PF_RETRY;
+ 	spin_lock(&vcpu->kvm->mmu_lock);
+ 	if (mmu_notifier_retry(vcpu->kvm, mmu_seq))
+ 		goto out_unlock;
+ 	if (make_mmu_pages_available(vcpu) < 0)
+ 		goto out_unlock;
+ 	if (likely(!force_pt_level))
+-		transparent_hugepage_adjust(vcpu, &gfn, &pfn, &level);
++		transparent_hugepage_adjust(vcpu, gfn, &pfn, &level);
+ 	r = __direct_map(vcpu, gpa, write, map_writable, level, pfn,
+ 			 prefault, lpage_disallowed);
+-	spin_unlock(&vcpu->kvm->mmu_lock);
+-
+-	return r;
+ 
+ out_unlock:
+ 	spin_unlock(&vcpu->kvm->mmu_lock);
+ 	kvm_release_pfn_clean(pfn);
+-	return RET_PF_RETRY;
++	return r;
+ }
+ 
+ static void nonpaging_init_context(struct kvm_vcpu *vcpu,
+diff --git a/arch/x86/kvm/paging_tmpl.h b/arch/x86/kvm/paging_tmpl.h
+index 988c971e1a90..001abf633c8f 100644
+--- a/arch/x86/kvm/paging_tmpl.h
++++ b/arch/x86/kvm/paging_tmpl.h
+@@ -523,6 +523,7 @@ FNAME(prefetch_gpte)(struct kvm_vcpu *vcpu, struct kvm_mmu_page *sp,
+ 	mmu_set_spte(vcpu, spte, pte_access, 0, PT_PAGE_TABLE_LEVEL, gfn, pfn,
+ 		     true, true);
+ 
++	kvm_release_pfn_clean(pfn);
+ 	return true;
+ }
+ 
+@@ -673,7 +674,6 @@ static int FNAME(fetch)(struct kvm_vcpu *vcpu, gva_t addr,
+ 	return ret;
+ 
+ out_gpte_changed:
+-	kvm_release_pfn_clean(pfn);
+ 	return RET_PF_RETRY;
+ }
+ 
+@@ -821,6 +821,7 @@ static int FNAME(page_fault)(struct kvm_vcpu *vcpu, gva_t addr, u32 error_code,
+ 			walker.pte_access &= ~ACC_EXEC_MASK;
+ 	}
+ 
++	r = RET_PF_RETRY;
+ 	spin_lock(&vcpu->kvm->mmu_lock);
+ 	if (mmu_notifier_retry(vcpu->kvm, mmu_seq))
+ 		goto out_unlock;
+@@ -829,18 +830,15 @@ static int FNAME(page_fault)(struct kvm_vcpu *vcpu, gva_t addr, u32 error_code,
+ 	if (make_mmu_pages_available(vcpu) < 0)
+ 		goto out_unlock;
+ 	if (!force_pt_level)
+-		transparent_hugepage_adjust(vcpu, &walker.gfn, &pfn, &level);
++		transparent_hugepage_adjust(vcpu, walker.gfn, &pfn, &level);
+ 	r = FNAME(fetch)(vcpu, addr, &walker, write_fault,
+ 			 level, pfn, map_writable, prefault);
+ 	kpatch_kvm_mmu_audit(vcpu, AUDIT_POST_PAGE_FAULT);
+-	spin_unlock(&vcpu->kvm->mmu_lock);
+-
+-	return r;
+ 
+ out_unlock:
+ 	spin_unlock(&vcpu->kvm->mmu_lock);
+ 	kvm_release_pfn_clean(pfn);
+-	return RET_PF_RETRY;
++	return r;
+ }
+ 
+ static gpa_t FNAME(get_level1_sp_gpa)(struct kvm_mmu_page *sp)
+-- 
+2.21.0
+
